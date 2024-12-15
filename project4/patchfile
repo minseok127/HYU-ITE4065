@@ -1,0 +1,778 @@
+diff --git include/ilist.h include/ilist.h
+index 92812ba8f5d..6df61fce194 100644
+--- include/ilist.h
++++ include/ilist.h
+@@ -21,6 +21,7 @@
+ 
+ #include "my_dbug.h"
+ 
++#include <assert.h>
+ #include <cstddef>
+ #include <iterator>
+ 
+@@ -202,6 +203,21 @@ template <class T, class Tag= void> class ilist
+   void push_front(reference value) noexcept { insert(begin(), value); }
+   void pop_front() noexcept { erase(begin()); }
+ 
++  void atomic_push_front(reference value) noexcept
++  {
++    // To prevent data race, set the target's prev before inserting
++    static_cast<ListNode &>(value).prev= &sentinel_;
++
++    __sync_synchronize();
++
++    // Atomic insert
++    ListNode* prev_begin= __sync_lock_test_and_set(&sentinel_.next, static_cast<ListNode *>(&value));
++
++    // Connect
++    static_cast<ListNode &>(value).next= prev_begin;
++    prev_begin->prev= static_cast<ListNode *>(&value);
++  }
++
+   // STL version is O(n) but this is O(1) because an element can't be inserted
+   // several times in the same ilist.
+   void remove(reference value) noexcept { erase(iterator(&value)); }
+diff --git storage/innobase/buf/buf0buf.cc storage/innobase/buf/buf0buf.cc
+index 1c126191df3..6bd6f969d06 100644
+--- storage/innobase/buf/buf0buf.cc
++++ storage/innobase/buf/buf0buf.cc
+@@ -31,6 +31,11 @@ The database buffer buf_pool
+ Created 11/5/1995 Heikki Tuuri
+ *******************************************************/
+ 
++#include <atomic>
++#include <mutex>
++#include <thread>
++#include <vector>
++
+ #include "assume_aligned.h"
+ #include "mtr0types.h"
+ #include "mach0data.h"
+@@ -1199,11 +1204,12 @@ void buf_page_print(const byte* read_buf, ulint zip_size)
+ }
+ 
+ /** Initialize a buffer page descriptor.
+-@param[in,out]	block	buffer page descriptor
+-@param[in]	frame	buffer page frame */
++@param[in,out]	block			buffer page descriptor
++@param[in]	frame			buffer page frame 
++@param[in]	in_buf_pool_create	whether this block is created in buf_pool_t::create() */
+ static
+ void
+-buf_block_init(buf_block_t* block, byte* frame)
++buf_block_init(buf_block_t* block, byte* frame, bool in_buf_pool_create)
+ {
+ 	/* This function should only be executed at database startup or by
+ 	buf_pool.resize(). Either way, adaptive hash index must not exist. */
+@@ -1223,10 +1229,18 @@ buf_block_init(buf_block_t* block, byte* frame)
+ 
+ 	ut_d(block->debug_latch = (rw_lock_t *) ut_malloc_nokey(sizeof(rw_lock_t)));
+ 
+-	rw_lock_create(PFS_NOT_INSTRUMENTED, &block->lock, SYNC_LEVEL_VARYING);
+-
+-	ut_d(rw_lock_create(PFS_NOT_INSTRUMENTED, block->debug_latch,
+-			    SYNC_LEVEL_VARYING));
++	if (in_buf_pool_create)
++	{
++		rw_lock_create_in_buf_pool_create(PFS_NOT_INSTRUMENTED, &block->lock, SYNC_LEVEL_VARYING, true);
++		ut_d(rw_lock_create_in_buf_pool_create(PFS_NOT_INSTRUMENTED, block->debug_latch,
++                            SYNC_LEVEL_VARYING, true));
++	}
++	else
++	{
++		rw_lock_create(PFS_NOT_INSTRUMENTED, &block->lock, SYNC_LEVEL_VARYING);
++		ut_d(rw_lock_create(PFS_NOT_INSTRUMENTED, block->debug_latch,
++                            SYNC_LEVEL_VARYING));
++	}
+ 
+ 	block->lock.is_block_lock = 1;
+ 
+@@ -1236,9 +1250,11 @@ buf_block_init(buf_block_t* block, byte* frame)
+ /** Allocate a chunk of buffer frames.
+ @param bytes    requested size
+ @return whether the allocation succeeded */
+-inline bool buf_pool_t::chunk_t::create(size_t bytes)
++inline bool buf_pool_t::chunk_t::create(size_t bytes, bool in_buf_pool_create)
+ {
+   DBUG_EXECUTE_IF("ib_buf_chunk_init_fails", return false;);
++  this->in_buf_pool_create= in_buf_pool_create;
++  
+   /* Round down to a multiple of page size, although it already should be. */
+   bytes= ut_2pow_round<size_t>(bytes, srv_page_size);
+ 
+@@ -1282,7 +1298,7 @@ inline bool buf_pool_t::chunk_t::create(size_t bytes)
+                                         srv_page_size - 1) &
+                                        ~ulint{srv_page_size - 1});
+   size= (mem_pfx.m_size >> srv_page_size_shift) - (frame != mem);
+-
++  
+   /* Subtract the space needed for block descriptors. */
+   {
+     ulint s= size;
+@@ -1296,16 +1312,44 @@ inline bool buf_pool_t::chunk_t::create(size_t bytes)
+     size= s;
+   }
+ 
++  /* If this function is called in buf_pool_t::create,
++  allocate os_event array to initialize rw_lock of each block */
++  if (in_buf_pool_create)
++# ifdef UNIV_DEBUG
++    this->os_event_array= os_event_array_create(size * 4); // Each block needs 4 os_event : block->lock (2), block->debug_latch (2)
++# else
++    this->os_event_array= os_event_array_create(size * 2); // Each block needs 2 os_event : block->lock (2)
++# endif
++
+   /* Init block structs and assign frames for them. Then we assign the
+   frames to the first blocks (we already mapped the memory above). */
+ 
+   buf_block_t *block= blocks;
+ 
++  ulint j= 0;
+   for (auto i= size; i--; ) {
+-    buf_block_init(block, frame);
++    buf_block_init(block, frame, in_buf_pool_create);
+     MEM_UNDEFINED(block->frame, srv_page_size);
+-    /* Add the block to the free list */
+-    UT_LIST_ADD_LAST(buf_pool.free, &block->page);
++    /* Add the block to the free list.
++    If this function is called in buf_pool_t::create, use atomic insert to reduce contention between threads. */
++    if (in_buf_pool_create)
++    {
++      /* Before inserting, allocate os_event_t to the block
++      because if chunk_t::create is called in buf_pool_t::create, buf_block_init did not make os_event_t */
++      os_event_connect(&block->lock.event, os_event_jump(os_event_array, j++));
++      os_event_connect(&block->lock.wait_ex_event, os_event_jump(os_event_array, j++));
++      /* Only initialize debug_latch when UNIV_DEBUG is defined */
++      ut_d(os_event_connect(
++              &block->debug_latch->event, os_event_jump(os_event_array, j++)));
++      ut_d(os_event_connect(
++              &block->debug_latch->wait_ex_event, os_event_jump(os_event_array, j++)));
++      
++      UT_LIST_ATOMIC_ADD_LAST(buf_pool.free, &block->page);
++    }
++    else
++    {
++      UT_LIST_ADD_LAST(buf_pool.free, &block->page);
++    }
+ 
+     ut_d(block->page.in_free_list = TRUE);
+     block++;
+@@ -1370,10 +1414,21 @@ inline const buf_block_t *buf_pool_t::chunk_t::not_freed() const
+ 
+ /** Free the synchronization objects of a buffer pool block descriptor
+ @param[in,out]	block	buffer pool block descriptor */
+-static void buf_block_free_mutexes(buf_block_t* block)
++static void buf_block_free_mutexes(buf_block_t* block, bool in_buf_pool_create= false)
+ {
+-	rw_lock_free(&block->lock);
+-	ut_d(rw_lock_free(block->debug_latch));
++	if (in_buf_pool_create)
++	{
++		/* Do not deallocate os_event, just remove the lock from the list. */
++		rw_lock_remove_from_list_func(&block->lock);
++		ut_d(rw_lock_remove_from_list_func(block->debug_latch));
++	}
++	else
++	{
++		/* Not only removing from the list, but also deallocate os_event. */
++		rw_lock_free(&block->lock);
++		ut_d(rw_lock_free(block->debug_latch));
++	}
++	
+ 	ut_d(ut_free(block->debug_latch));
+ }
+ 
+@@ -1418,7 +1473,95 @@ bool buf_pool_t::create()
+   chunks= static_cast<chunk_t*>(ut_zalloc_nokey(n_chunks * sizeof *chunks));
+   UT_LIST_INIT(free, &buf_page_t::list);
+   curr_size= 0;
+-  auto chunk= chunks;
++  
++  /* Multi thread chunk initializing */
++  std::atomic<bool> chunk_init_fail_flag(false);
++  std::vector<bool> chunk_init_success_vector;
++  chunk_init_success_vector.resize(n_chunks);
++
++  /* Thread function */
++  auto buf_chunk_init= [&](ulint start_chunk_index, ulint end_chunk_index) 
++                       {
++                         chunk_t* start_chunk= chunks + start_chunk_index;
++                         chunk_t* chunk= start_chunk;
++                         for (ulint cid= start_chunk_index; cid < end_chunk_index; cid++)
++                         {                       
++                           if (!chunk->create(chunk_size, true))
++                           {
++                             chunk_init_fail_flag.store(true);
++                           }
++                           else
++                           {
++                             chunk_init_success_vector[cid] = true;
++                             curr_size+= chunk->size;
++                           }
++
++                           if (chunk_init_fail_flag.load())
++                             return;
++ 
++                           chunk++;
++                         }
++                       };
++
++  /* Create as many threads as there are cpus to parallelize chunk_t::create */
++  ulint cpu_num= sysconf(_SC_NPROCESSORS_ONLN);
++  std::vector<std::thread> thread_vec;
++  
++  /* ex) n_chunks : 128 | cpu_num : 20 => chunk_init_unit : 6 | remains : 8
++  Distribute it as 7 7 7 7 7 7 7 7 6 6 6 6 6 6 6 6 6 6 6 6 (20 threads, total chunk count is 128) */
++  ulint chunk_init_unit= n_chunks > cpu_num ? n_chunks / cpu_num : n_chunks;
++  int remains= n_chunks > cpu_num ? static_cast<int>(n_chunks - chunk_init_unit * cpu_num) : 0;
++  ulint start_chunk_index= 0;
++  ulint end_chunk_index= 0;
++  ulint chunk_init_count= 0;  
++  for (ulint tid= 0; tid < cpu_num; tid++)
++  {
++    chunk_init_count= remains-- > 0 ? chunk_init_unit + 1 : chunk_init_unit;
++    end_chunk_index= start_chunk_index + chunk_init_count; 
++    thread_vec.emplace_back(buf_chunk_init, start_chunk_index, end_chunk_index);
++
++    if (end_chunk_index == n_chunks)
++      break;
++
++    start_chunk_index= end_chunk_index;
++  }
++  for (size_t tid= 0; tid < thread_vec.size(); tid++)
++  {
++    thread_vec[tid].join();
++  }
++
++  /* If any chunk fails to initialize, uninitialize all chunks. */
++  if (chunk_init_fail_flag.load())
++  {
++    for (ulint cid= 0; cid < n_chunks; cid++)
++    {
++      if (chunk_init_success_vector[cid])
++      {
++        chunk_t* chunk= chunks + cid;
++        buf_block_t* block= chunk->blocks;
++
++        /* Just remove the lock from the rw_lock_list */
++        for (auto i= chunk->size; i--; block++)
++          buf_block_free_mutexes(block, true);
++
++        /* free the array */
++        os_event_array_destroy(chunk->os_event_array);
++
++        allocator.deallocate_large_dodump(chunk->mem, &chunk->mem_pfx);
++      }
++    }
++    ut_free(chunks);
++    chunks= nullptr;
++    UT_DELETE(chunk_t::map_reg);
++    chunk_t::map_reg= nullptr;
++    aligned_free(const_cast<byte*>(field_ref_zero));
++    field_ref_zero= nullptr;
++    ut_ad(!is_initialised());
++    return true;
++  }
++
++  //Original single thread code
++  /*auto chunk= chunks;
+ 
+   do
+   {
+@@ -1445,7 +1588,7 @@ bool buf_pool_t::create()
+ 
+     curr_size+= chunk->size;
+   }
+-  while (++chunk < chunks + n_chunks);
++  while (++chunk < chunks + n_chunks); */
+ 
+   ut_ad(is_initialised());
+   mysql_mutex_init(buf_pool_mutex_key, &mutex, MY_MUTEX_INIT_FAST);
+@@ -1535,8 +1678,25 @@ void buf_pool_t::close()
+   {
+     buf_block_t *block= chunk->blocks;
+ 
+-    for (auto i= chunk->size; i--; block++)
+-      buf_block_free_mutexes(block);
++    /* If this chunk is created in buf_pool_t::create,
++    do not free each mutexes, because they are allocated as an array */
++    if (chunk->in_buf_pool_create)
++    {
++      /* Just remove the lock from the rw_lock_list. 
++      Do not deallocate each os_event */
++      for (auto i= chunk->size; i--; block++)
++        buf_block_free_mutexes(block, true);
++
++      /* Deallocate the array of os_event */
++      os_event_array_destroy(chunk->os_event_array);
++    }
++    else
++    {
++      /* Not only remove the lock from the rw_lock list, 
++      but also deallocate each os_event */
++      for (auto i= chunk->size; i--; block++)
++        buf_block_free_mutexes(block);
++    }
+ 
+     allocator.deallocate_large_dodump(chunk->mem, &chunk->mem_pfx);
+   }
+diff --git storage/innobase/include/buf0buf.h storage/innobase/include/buf0buf.h
+index e5e15730253..ed1e16587fd 100644
+--- storage/innobase/include/buf0buf.h
++++ storage/innobase/include/buf0buf.h
+@@ -1055,16 +1055,16 @@ struct buf_block_t{
+ 	/** @name General fields */
+ 	/* @{ */
+ 
+-	buf_page_t	page;		/*!< page information; this must
+-					be the first field, so that
+-					buf_pool.page_hash can point
+-					to buf_page_t or buf_block_t */
+-	byte*		frame;		/*!< pointer to buffer frame which
+-					is of size srv_page_size, and
+-					aligned to an address divisible by
+-					srv_page_size */
+-	rw_lock_t	lock;		/*!< read-write lock of the buffer
+-					frame */
++	buf_page_t	page;				/*!< page information; this must
++							be the first field, so that
++							buf_pool.page_hash can point
++							to buf_page_t or buf_block_t */
++	byte*		frame;				/*!< pointer to buffer frame which
++							is of size srv_page_size, and
++							aligned to an address divisible by
++							srv_page_size */
++	rw_lock_t	lock;				/*!< read-write lock of the buffer
++							frame */
+ #ifdef UNIV_DEBUG
+   /** whether page.list is in buf_pool.withdraw
+   ((state() == BUF_BLOCK_NOT_USED)) and the buffer pool is being shrunk;
+@@ -1404,6 +1404,11 @@ class buf_pool_t
+     ut_new_pfx_t mem_pfx;
+     /** array of buffer control blocks */
+     buf_block_t *blocks;
++    /** Whether this chunk is created in buf_pool_t::create() */
++    bool in_buf_pool_create= false;
++    /** If this chunk is created in buf_pool_t::create(), 
++    All rw_lock_t::os_event_t of blocks[] are allocated in this array */
++    os_event* os_event_array= nullptr;
+ 
+     /** Map of first page frame address to chunks[] */
+     using map= std::map<const void*, chunk_t*, std::less<const void*>,
+@@ -1420,9 +1425,10 @@ class buf_pool_t
+     void reg() { map_reg->emplace(map::value_type(blocks->frame, this)); }
+ 
+     /** Allocate a chunk of buffer frames.
+-    @param bytes    requested size
+-    @return whether the allocation succeeded */
+-    inline bool create(size_t bytes);
++    @param bytes		requested size
++    @param in_buf_pool_create	whether this function is called in buf_pool_t::create
++    @return whether the allocation succeeded  */
++    inline bool create(size_t bytes, bool in_buf_pool_create= false);
+ 
+ #ifdef UNIV_DEBUG
+     /** Find a block that points to a ROW_FORMAT=COMPRESSED page
+diff --git storage/innobase/include/os0event.h storage/innobase/include/os0event.h
+index 52f6500ae63..f5aa05335a0 100644
+--- storage/innobase/include/os0event.h
++++ storage/innobase/include/os0event.h
+@@ -44,6 +44,29 @@ explicitly by calling os_event_reset().
+ @return	the event handle */
+ os_event_t os_event_create(const char*);
+ 
++/**
++Creates an event semaphore array
++@return the array of event handle */
++os_event_t os_event_array_create(
++/*=============================*/
++	ulint n_elements); /*!< in: size of array */
++
++/**
++Connect an event pointers */
++void
++os_event_connect(
++/*=============*/
++        os_event_t* dest,                        /*!< in/out: Destination */
++        const os_event_t src);                   /*!< in/out: Source */
++
++/**
++Pointer operation of os_event_t */
++os_event_t
++os_event_jump(
++/*==========*/
++        os_event_t              src,            /*!< in/out: Start pointer */
++        ulint                   num);           /*!< in: size of jump */ 
++
+ /**
+ Sets an event semaphore to the signaled state: lets waiting threads
+ proceed. */
+@@ -79,6 +102,13 @@ os_event_destroy(
+ /*=============*/
+ 	os_event_t&	event);	/*!< in/own: event to free */
+ 
++/**
++Frees an event object array. */
++void
++os_event_array_destroy(
++/*===================*/
++        os_event_t&     event_array);            /*1< in/own: event array to free */
++
+ /**
+ Waits for an event object until it is in the signaled state.
+ 
+diff --git storage/innobase/include/sync0rw.h storage/innobase/include/sync0rw.h
+index 084acc51d1f..e0581464c92 100644
+--- storage/innobase/include/sync0rw.h
++++ storage/innobase/include/sync0rw.h
+@@ -123,9 +123,13 @@ defined, the rwlock are instrumented with performance schema probes. */
+ # ifdef UNIV_DEBUG
+ #  define rw_lock_create(K, L, level)				\
+ 	rw_lock_create_func((L), (level), __FILE__, __LINE__)
++#  define rw_lock_create_in_buf_pool_create(K, L, level, flag)  \
++ 	rw_lock_craete_func((L), (level), __FILE__, __LINE__, flag)
+ # else /* UNIV_DEBUG */
+ #  define rw_lock_create(K, L, level)				\
+ 	rw_lock_create_func((L), __FILE__, __LINE__)
++#  define rw_lock_craete_in_buf_pool_craete(K, L, level, flag)  \
++	rw_lock_create_func((L), __FILE__, __LINE__, flag)
+ # endif	/* UNIV_DEBUG */
+ 
+ /**************************************************************//**
+@@ -211,9 +215,13 @@ unlocking, not the corresponding function. */
+ # ifdef UNIV_DEBUG
+ #   define rw_lock_create(K, L, level)				\
+ 	pfs_rw_lock_create_func((K), (L), (level), __FILE__, __LINE__)
++#   define rw_lock_create_in_buf_pool_create(K, L, level, flag) \
++        pfs_rw_lock_create_func((K), (L), (level), __FILE__, __LINE__, flag)
+ # else	/* UNIV_DEBUG */
+ #  define rw_lock_create(K, L, level)				\
+ 	pfs_rw_lock_create_func((K), (L), __FILE__, __LINE__)
++#  define rw_lock_create_in_buf_pool_create(K, L, level, flag)  \
++        pfs_rw_lock_create_func((K), (L), __FILE__, __LINE__, flag)
+ # endif	/* UNIV_DEBUG */
+ 
+ /******************************************************************
+@@ -294,12 +302,13 @@ is necessary only if the memory block containing it is freed. */
+ void
+ rw_lock_create_func(
+ /*================*/
+-	rw_lock_t*	lock,		/*!< in: pointer to memory */
++	rw_lock_t*	lock,				/*!< in: pointer to memory */
+ #ifdef UNIV_DEBUG
+-	latch_level_t	level,		/*!< in: level */
++	latch_level_t	level,				/*!< in: level */
+ #endif /* UNIV_DEBUG */
+-	const char*	cfile_name,	/*!< in: file name where created */
+-	unsigned	cline);		/*!< in: file line where created */
++	const char*	cfile_name,			/*!< in: file name where created */
++	unsigned	cline,				/*!< in: file line where created */
++	bool		in_buf_pool_create= false);	/*!< in: whether this function is called in buf_pool_t::create */
+ /******************************************************************//**
+ Calling this function is obligatory only if the memory buffer containing
+ the rw-lock is freed. Removes an rw-lock object from the global list. The
+@@ -308,6 +317,13 @@ void
+ rw_lock_free_func(
+ /*==============*/
+ 	rw_lock_t*	lock);		/*!< in/out: rw-lock */
++/******************************************************************//**
++Just remove the lock from rw_lock_list.
++Do not destroy os_event. */
++void
++rw_lock_remove_from_list_func(
++/*==========================*/  
++        rw_lock_t*      lock);   /*!< in/out: rw_lock */
+ #ifdef UNIV_DEBUG
+ /******************************************************************//**
+ Checks that the rw-lock has been initialized and that there are no
+@@ -679,14 +695,15 @@ UNIV_INLINE
+ void
+ pfs_rw_lock_create_func(
+ /*====================*/
+-	PSI_rwlock_key  key,		/*!< in: key registered with
+-					performance schema */
+-	rw_lock_t*	lock,		/*!< in: rw lock */
++	PSI_rwlock_key  key,				/*!< in: key registered with
++							performance schema */
++	rw_lock_t*	lock,				/*!< in: rw lock */
+ #ifdef UNIV_DEBUG
+-	latch_level_t	level,		/*!< in: level */
++	latch_level_t	level,				/*!< in: level */
+ #endif /* UNIV_DEBUG */
+-	const char*	cfile_name,	/*!< in: file name where created */
+-	unsigned	cline);		/*!< in: file line where created */
++	const char*	cfile_name,			/*!< in: file name where created */
++	unsigned	cline,				/*!< in: file line where created */
++	bool		in_buf_pool_create= false);	/*!< in: whether this function is called in buf_pool_t::create */
+ 
+ /******************************************************************//**
+ Performance schema instrumented wrap function for rw_lock_x_lock_func()
+diff --git storage/innobase/include/sync0rw.ic storage/innobase/include/sync0rw.ic
+index 169cbdd9aa5..a17dc2683b3 100644
+--- storage/innobase/include/sync0rw.ic
++++ storage/innobase/include/sync0rw.ic
+@@ -496,14 +496,15 @@ UNIV_INLINE
+ void
+ pfs_rw_lock_create_func(
+ /*====================*/
+-	mysql_pfs_key_t	key,		/*!< in: key registered with
+-					performance schema */
+-	rw_lock_t*	lock,		/*!< in/out: pointer to memory */
++	mysql_pfs_key_t	key,			/*!< in: key registered with
++						performance schema */
++	rw_lock_t*	lock,			/*!< in/out: pointer to memory */
+ # ifdef UNIV_DEBUG
+-	latch_level_t	level,		/*!< in: level */
++	latch_level_t	level,			/*!< in: level */
+ # endif /* UNIV_DEBUG */
+-	const char*	cfile_name,	/*!< in: file name where created */
+-	unsigned	cline)		/*!< in: file line where created */
++	const char*	cfile_name,		/*!< in: file name where created */
++	unsigned	cline,			/*!< in: file line where created */
++	bool		in_buf_pool_create)	/*!< in: whether this function is called in buf_pool_t::create */
+ {
+ 	ut_d(new(lock) rw_lock_t());
+ 
+@@ -516,7 +517,8 @@ pfs_rw_lock_create_func(
+ 			    level,
+ #endif /* UNIV_DEBUG */
+ 			    cfile_name,
+-			    cline);
++			    cline,
++			    in_buf_pool_create);
+ }
+ /******************************************************************//**
+ Performance schema instrumented wrap function for rw_lock_x_lock_func()
+diff --git storage/innobase/include/ut0lst.h storage/innobase/include/ut0lst.h
+index 9a5f3059826..2852297259e 100644
+--- storage/innobase/include/ut0lst.h
++++ storage/innobase/include/ut0lst.h
+@@ -213,6 +213,41 @@ ut_list_append(
+ 	++list.count;
+ }
+ 
++template <typename List, typename Functor>
++void
++ut_list_atomic_append(
++        List&                           list,
++        typename List::elem_type*       elem,
++        Functor                         get_node)
++{
++        typename List::node_type&       node = get_node(*elem);
++
++        UT_LIST_IS_INITIALISED(list);
++
++        node.next = 0;
++
++	__sync_synchronize();
++
++	// Atomic insert
++	typename List::elem_type* prev_end = __sync_lock_test_and_set(&list.end, elem);
++        
++	// Connect
++	if (prev_end != 0) {
++		typename List::node_type&	base_node = get_node(*prev_end);
++
++		base_node.next = elem;
++		node.prev = prev_end;
++	}
++	else {
++		list.start = elem;
++		node.prev = 0;
++	}
++	
++        
++        __sync_fetch_and_add(&list.count, 1);
++}
++
++
+ /*******************************************************************//**
+ Adds the node as the last element in a two-way linked list.
+ @param list list
+@@ -228,11 +263,23 @@ ut_list_append(
+ 		GenericGetNode<typename List::elem_type>(list.node));
+ }
+ 
++template <typename List>
++void
++ut_list_atomic_append(
++        List&                           list,
++        typename List::elem_type*       elem)
++{
++        ut_list_atomic_append(
++                list, elem,
++                GenericGetNode<typename List::elem_type>(list.node));
++}
++
+ /*******************************************************************//**
+ Adds the node as the last element in a two-way linked list.
+ @param LIST list base node (not a pointer to it)
+ @param ELEM the element to add */
+ #define UT_LIST_ADD_LAST(LIST, ELEM)	ut_list_append(LIST, ELEM)
++#define UT_LIST_ATOMIC_ADD_LAST(LIST, ELEM) ut_list_atomic_append(LIST, ELEM)
+ 
+ /*******************************************************************//**
+ Inserts a ELEM2 after ELEM1 in a list.
+diff --git storage/innobase/os/os0event.cc storage/innobase/os/os0event.cc
+index f18633ccd45..3f151d13be0 100644
+--- storage/innobase/os/os0event.cc
++++ storage/innobase/os/os0event.cc
+@@ -429,6 +429,38 @@ os_event_t os_event_create(const char*)
+ 	return(UT_NEW_NOKEY(os_event()));
+ }
+ 
++/**
++Creates an event semaphore array
++@return the array of event handle */
++os_event_t os_event_array_create(
++/*=============================*/
++	ulint n_elements)			/*!< in: size of array */
++{
++	return(UT_NEW_ARRAY_NOKEY(os_event, n_elements));
++}
++
++/**
++Connect an event pointers */
++void
++os_event_connect(
++/*=============*/
++	os_event_t* 		dest, 		/*!< in/out: Destination */
++	const os_event_t 	src)		/*!< in/out: Source */
++{
++	*dest= src;
++}
++
++/**
++Pointer operation of os_event_t */
++os_event_t
++os_event_jump(
++/*==========*/
++	os_event_t 		src,		/*!< in/out: Start pointer */
++	ulint			num)		/*!< in: size of jump */
++{
++	return (src + num);
++} 			
++
+ /**
+ Check if the event is set.
+ @return true if set */
+@@ -513,3 +545,14 @@ os_event_destroy(
+ 	UT_DELETE(event);
+ 	event = NULL;
+ }
++
++/**
++Frees an event object array. */
++void
++os_event_array_destroy(
++/*===================*/
++	os_event_t&	event_array)		/*1< in/own: event array to free */
++{
++	UT_DELETE_ARRAY(event_array);
++	event_array = NULL;
++}
+diff --git storage/innobase/srv/srv0start.cc storage/innobase/srv/srv0start.cc
+index aa6e7ce11f9..7c6e930891d 100644
+--- storage/innobase/srv/srv0start.cc
++++ storage/innobase/srv/srv0start.cc
+@@ -39,6 +39,8 @@ Starts the InnoDB database server
+ Created 2/16/1996 Heikki Tuuri
+ *************************************************************************/
+ 
++#include <chrono>
++
+ #include "my_global.h"
+ 
+ #include "mysqld.h"
+@@ -1227,13 +1229,16 @@ dberr_t srv_start(bool create_new_db)
+ 		<< srv_buf_pool_size
+ 		<< ", chunk size = " << srv_buf_pool_chunk_unit;
+ 
++	auto buf_pool_create_start= std::chrono::system_clock::now();
+ 	if (buf_pool.create()) {
+ 		ib::error() << "Cannot allocate memory for the buffer pool";
+ 
+ 		return(srv_init_abort(DB_ERROR));
+ 	}
++	auto buf_pool_create_end= std::chrono::system_clock::now();
+ 
+ 	ib::info() << "Completed initialization of buffer pool";
++	ib::info() << "Buffer pool initialization elapsed time : " << std::chrono::duration_cast<std::chrono::milliseconds>(buf_pool_create_end - buf_pool_create_start).count();
+ 
+ #ifdef UNIV_DEBUG
+ 	/* We have observed deadlocks with a 5MB buffer pool but
+diff --git storage/innobase/sync/sync0rw.cc storage/innobase/sync/sync0rw.cc
+index 2624ffb9e46..e7cc899f998 100644
+--- storage/innobase/sync/sync0rw.cc
++++ storage/innobase/sync/sync0rw.cc
+@@ -190,12 +190,13 @@ is necessary only if the memory block containing it is freed. */
+ void
+ rw_lock_create_func(
+ /*================*/
+-	rw_lock_t*	lock,		/*!< in: pointer to memory */
++	rw_lock_t*	lock,			/*!< in: pointer to memory */
+ #ifdef UNIV_DEBUG
+-	latch_level_t	level,		/*!< in: level */
++	latch_level_t	level,			/*!< in: level */
+ #endif /* UNIV_DEBUG */
+-	const char*	cfile_name,	/*!< in: file name where created */
+-	unsigned	cline)		/*!< in: file line where created */
++	const char*	cfile_name,		/*!< in: file name where created */
++	unsigned	cline,			/*!< in: file line where created */
++	bool		in_buf_pool_create)	/*!< in: whether this function is called in buf_pool_t::create */
+ {
+ #if defined(UNIV_DEBUG) && !defined(UNIV_PFS_RWLOCK)
+ 	/* It should have been created in pfs_rw_lock_create_func() */
+@@ -229,13 +230,23 @@ rw_lock_create_func(
+ 	lock->count_os_wait = 0;
+ 	lock->last_x_file_name = "not yet reserved";
+ 	lock->last_x_line = 0;
+-	lock->event = os_event_create(0);
+-	lock->wait_ex_event = os_event_create(0);
+ 
+ 	lock->is_block_lock = 0;
+ 
+ 	ut_d(lock->created = true);
+ 
++	/* If this function is called in buf_pool_t::create,
++	do not create os_event. It will be created after this function.
++	Also use atomic push front to reduce contention */
++	if (in_buf_pool_create)
++	{
++		rw_lock_list.atomic_push_front(*lock);
++		return;
++	}
++
++	lock->event = os_event_create(0);
++	lock->wait_ex_event = os_event_create(0);
++
+ 	mutex_enter(&rw_lock_list_mutex);
+ 	rw_lock_list.push_front(*lock);
+ 	mutex_exit(&rw_lock_list_mutex);
+@@ -266,6 +277,26 @@ rw_lock_free_func(
+ 	mutex_exit(&rw_lock_list_mutex);
+ }
+ 
++/******************************************************************//**
++Just remove the lock from rw_lock_list.
++Do not destroy os_event. */
++void
++rw_lock_remove_from_list_func(
++/*==========================*/
++	rw_lock_t*	lock)	/*!< in/out: rw_lock */
++{
++	ut_ad(rw_lock_validate(lock));
++        ut_a(lock->lock_word == X_LOCK_DECR);
++  
++        ut_d(lock->created = false);
++
++	mutex_enter(&rw_lock_list_mutex);
++
++	rw_lock_list.remove(*lock);
++
++	mutex_exit(&rw_lock_list_mutex);
++}
++
+ /******************************************************************//**
+ Lock an rw-lock in shared mode for the current thread. If the rw-lock is
+ locked in exclusive mode, or there is an exclusive lock request waiting,
