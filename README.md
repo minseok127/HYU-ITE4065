@@ -1,4 +1,6 @@
-**This repository contains projects implemented during a parallel programming course. The projects include:**
+**This repository contains projects implemented during a parallel programming course.**
+
+**The projects include:**
 
 **1. Optimizing a join algorithm implemented in memory.**
 
