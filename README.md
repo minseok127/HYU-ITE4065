@@ -9,7 +9,8 @@
 - Multi-version
 
 **3. Developing a lock-free two-phase locking (2PL) mechanism.**
-- d
+- It doesn't matter determining a non-deadlock as a deadlock. Because you can try again.
+- But it's a problem to decide that a real deadlock as a non-deadlock.
 
 **4. Making the MariaDB buffer pool initialization process scalable.**
 - Atomic instruction
