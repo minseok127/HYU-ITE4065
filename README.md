@@ -1,2 +1,1 @@
-Parallel Programming Course [HYU-ITE4065, 2st semester 2021]
-===============================================================
+This repository contains projects implemented during a parallel programming course.
