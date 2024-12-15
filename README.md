@@ -13,5 +13,5 @@
 - But it's a problem to decide that a real deadlock as a non-deadlock.
 
 **4. Making the MariaDB buffer pool initialization process scalable.**
-- Atomic instruction.
+- Use atomic instruction.
 - malloc() page fault overhead.
