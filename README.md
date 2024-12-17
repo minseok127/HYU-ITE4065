@@ -6,12 +6,12 @@
 - Morsel driven parallelism.
 
 **2. Implementing a wait-free atomic snapshot.**
-- Multi-version.
+- Multi-versioning.
 
 **3. Developing a lock-free two-phase locking (2PL) mechanism.**
 - It doesn't matter determining a non-deadlock as a deadlock. Because you can try again.
-- But it's a problem to decide that a real deadlock as a non-deadlock.
+- But it's not ok to decide that a real deadlock as a non-deadlock.
 
 **4. Making the MariaDB buffer pool initialization process scalable.**
-- Use atomic instruction.
-- malloc() page fault overhead.
+- Use wait-free algorithm for linked list.
+- Release malloc() page fault overhead.
