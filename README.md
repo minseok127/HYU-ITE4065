@@ -2,10 +2,10 @@
 
 **The projects include:**
 
-**1. Optimizing a join algorithm implemented in memory.**
+### **1. Optimizing a join algorithm implemented in memory.**
 - Morsel driven parallelism.
 
-**2. Implementing a wait-free atomic snapshot.**
+### **2. Implementing a wait-free atomic snapshot.**
 ```
 // Writers have their own snapshot and this snapshot can be read by multiple readers.
 // So if the writers just deallocate existing snapshots to replace it, the readers may access to the wrong memory.
@@ -37,7 +37,7 @@
 // So, the reader must notice to the other reference counter, inner counter.
 ```
 
-**3. Developing a lock-free two-phase locking (2PL) mechanism.**
+### **3. Developing a lock-free two-phase locking (2PL) mechanism.**
 ```
 // Deadlock means that more than two transactions are waiting for each other.
 // In acquire(), we got a vector containing the locks that the new_lock might be waiting for.
@@ -66,6 +66,6 @@
 // But this is not a problem because the transaction that changed the conflict lock will look at our fixed conflict lock, then it will find a new deadlock on its deadlock checking.
 ```
 
-**4. Making the MariaDB buffer pool initialization process scalable.**
+### **4. Making the MariaDB buffer pool initialization process scalable.**
 - Use wait-free algorithm for linked list.
 - Release malloc() page fault overhead.
