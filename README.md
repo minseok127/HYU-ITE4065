@@ -68,4 +68,20 @@
 
 ### **4. Making the MariaDB buffer pool initialization process scalable.**
 - Use wait-free algorithm for linked list.
+```
++  void atomic_push_front(reference value) noexcept
++  {
++    // To prevent data race, set the target's prev before inserting
++    static_cast<ListNode &>(value).prev= &sentinel_;
++
++    __sync_synchronize();
++
++    // Atomic insert
++    ListNode* prev_begin= __sync_lock_test_and_set(&sentinel_.next, static_cast<ListNode *>(&value));
++
++    // Connect
++    static_cast<ListNode &>(value).next= prev_begin;
++    prev_begin->prev= static_cast<ListNode *>(&value);
++  }
+```
 - Release malloc() page fault overhead.
