@@ -5,7 +5,7 @@
 ### **1. Optimizing a join algorithm implemented in memory.**
 - Morsel driven parallelism.
 
-### **2. Implementing an wait-free atomic snapshot.**
+### **2. Implementing a wait-free atomic snapshot.**
 ```
 // Writers have their own snapshot and this snapshot can be read by multiple readers.
 // So if the writers just deallocate existing snapshots to replace it, the readers may access to the wrong memory.
