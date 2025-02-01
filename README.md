@@ -2,7 +2,7 @@
 
 **The projects include:**
 
-### **1. Optimizing a join algorithm implemented in memory.**
+### **1. Optimizing an in-memory join algorithm.**
 - Morsel driven parallelism.
 
 ### **2. Implementing a wait-free atomic snapshot.**
